@@ -31,6 +31,8 @@ Roguelike 2D top-down estilo *The Binding of Isaac*: 6 pisos procedurales, folk-
 - **Host autoritativo (P1):** simula mazmorra, enemigos, lágrimas, daño y tienda. Emite snapshots JSON ~20/s.
 - **Guest (P2):** envía inputs `{mx,my,sx,sy,b}` ~30/s y renderiza snapshots (sin simular).
 - **Señalización online:** nube gratuita de PeerJS; luego el tráfico es P2P directo (WebRTC DataChannel).
+- **Relay anti-NAT (nuevo):** si el P2P no cruza (NAT simétrico/firewall), el juego conmuta solo a un relay MQTT público por `wss :443` (broker.emqx.io, respaldo mosquitto) vía Paho CDN. Sin cuentas, sin servidor propio. STUN Google + TURN OpenRelay/PeerJS como primera línea.
+- **Doble vía con deduplicación:** relay inmediato + upgrade a P2P cuando abre; snapshots/inputs/hellos llevan secuencia (`sq`/`iq`/`hid`) y se ignora lo viejo o duplicado.
 - **Señalización LAN:** WebRTC manual con códigos copiar-pegar (funciona offline).
 - **Salas:** `martirio-azul-<CODIGO>` como Peer ID; varias salas simultáneas sin colisiones.
 - **Bordes:** caída de un peer (el otro sigue), códigos inválidos, R solo en host (reinicia a ambos), revive co-op por sala limpia.

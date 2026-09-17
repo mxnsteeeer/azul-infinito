@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Nosifer&family=Special+Elite&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/mqttws31.min.js"></script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:#060609; color:#d8d0c0; font-family:'Special Elite','Courier New',monospace; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; padding:16px; }
@@ -41,6 +42,11 @@
   <button id="btnCopyLink" style="font-family:inherit;padding:4px 12px;cursor:pointer;margin-top:4px;">🔗 Copiar link de sala</button></div>
 </div>
 <script>
+// MAPA DEL ARCHIVO (un solo HTML, orden de lectura):
+//  0. Constantes/canvas/input      4. Contenido (pasivas, pisos, bichos, jefes)
+//  1. Utilidades + helpers tinta   5. Simulación (update, cerebros, salas)
+//  2. Mazmorra procedural          6. Render (sala, bichos, jugador, CRT, HUD)
+//  3. RED: P2P WebRTC + relay MQTT + snapshots (ver bloque NETCODE abajo)
 const cv = document.getElementById('game');
 const ctx = cv.getContext('2d');
 const W = 800, H = 600;
@@ -52,7 +58,7 @@ addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if(['arrowu
 addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
 let state = 'title';
-let dungeon, cur, player, player2, remoteInput, tears, ebullets, particles, corpses, motes, bubbles, shake, frame, startTime, killCount, pickupMsg, evQueue, placed;
+let dungeon, cur, player, player2, remoteInput, tears, ebullets, particles, corpses, motes, bubbles, shake, frame, startTime, killCount, pickupMsg, evQueue, placed, lastSnap, lastIq, lastHid;
 
 const PASSIVES = {
   mano:    { name:'MANO AZUL',          desc:'Lágrimas espectrales: +alcance, luz azul', color:'#60a5fa' },
@@ -399,7 +405,7 @@ function hasNeighbor(r,dx,dy){ return !!dungeon.map[dungeon.key(r.x+dx,r.y+dy)];
 // R solo en host (reinicia a ambos vía netHello), revive co-op por sala limpia.
 // ============================================================================
 // ---------- CO-OP LAN (WebRTC manual, sin servidor) ----------
-const net={role:null,pc:null,dc:null,waitAnswer:false};
+const net={role:null,pc:null,dc:null,waitAnswer:false,seq:0,hid:0,iseq:0,fast:false};
 function el(id){ try{ return document.getElementById(id); }catch(e){ return null; } }
 function netStat(s){ const e=el('netstat'); if(e) e.textContent=s; }
 function makePlayer(){
@@ -527,13 +533,16 @@ function onlineSetup(conn){
   net.dc={ readyState:'connecting', send(s){ try{ conn.send(s); }catch(e){} } };
   conn.on('open',()=>{
     try{ if(conn._to) clearTimeout(conn._to); }catch(e){}
+    net.fast=true;
     net.dc.readyState='open';
     const bl=el('btnLeave'); if(bl) bl.disabled=false;
     if(net.role==='host'){ netStat('🟢 sala '+online.code+': P2 conectado'); if(!player2){ player2=makePlayer(); player2.x=440; player2.y=380; } netHello(); hidePanel(); }
     else netStat('🟢 en sala '+online.code+' como P2');
   });
   conn.on('iceStateChanged',(st)=>{
-    if(net.dc&&net.dc.readyState!=='open'&&st) netStat('⏳ red: '+st+'… (cruzando NAT, espera)');
+    if(!(net.dc&&net.dc.readyState!=='open'&&st)) return;
+    if(st==='disconnected'||st==='failed') netStat('🟡 P2P sin ruta: sigues por relay (juega igual)');
+    else netStat('⏳ red: '+st+'… (cruzando NAT, el relay ya te conecta)');
   });
   if(net.role==='guest'){
     try{ if(conn._to) clearTimeout(conn._to); }catch(e){}
@@ -566,6 +575,7 @@ function onlineHost(){
   online.peer.on('connection',(c)=>{ online.conn=c; onlineSetup(c); });
   online.peer.on('error',(e)=>{ if(e&&e.type==='unavailable-id') netStat('⚠️ código en uso, pulsa Crear sala otra vez'); });
   const bl=el('btnLeave'); if(bl) bl.disabled=false;
+  relayConnect(()=>{});
 }
 function onlineJoin(){
   if(typeof Peer==='undefined'){ netStat('❌ sin internet o CDN bloqueado (usa modo LAN manual)'); return; }
@@ -582,6 +592,69 @@ function onlineJoin(){
     onlineSetup(online.conn);
   });
   online.peer.on('error',()=>{ netStat('❌ sala no encontrada (¿código bien? ¿host con el juego abierto?)'); });
+  relayConnect(ok=>{ if(ok){ relaySend(relayTopics().g2h,{k:'join'}); if(!(net.dc&&net.dc.readyState==='open')) netStat('⏳ sala '+code+' por relay… (si el P2P abre, migra solo)'); } });
+}
+// --- RELAY MQTT (wss :443: cruza NATs y firewalls que matan el UDP del P2P).
+// Broker público, sin cuentas. Transporte de respaldo/paralelo al P2P:
+// el guest entra por relay al instante y "asciende" a P2P si este abre.
+// Deduplicación por secuencia: snapshots (sq), inputs (iq), hellos (hid).
+const relay={client:null,ready:false};
+const RELAY_BROKERS=[{host:'broker.emqx.io',port:8084,path:'/mqtt'},{host:'test.mosquitto.org',port:8081,path:'/mqtt'}];
+function relayTopics(){ return {h2g:'martirio-azul/'+online.code+'/h2g', g2h:'martirio-azul/'+online.code+'/g2h'}; }
+function hostGotInput(m){
+  if(m.iq!=null){ if(lastIq!=null&&m.iq<=lastIq) return; lastIq=m.iq; }
+  remoteInput={mx:+m.mx||0,my:+m.my||0,sx:+m.sx||0,sy:+m.sy||0,b:+m.b||0};
+}
+function relaySend(topic,obj){
+  try{
+    if(relay.client&&relay.ready&&topic){
+      const msg=new Paho.MQTT.Message(typeof obj==='string'?obj:JSON.stringify(obj));
+      msg.destinationName=topic; msg.qos=0; relay.client.send(msg); return true;
+    }
+  }catch(e){}
+  return false;
+}
+function relayNote(t){
+  if(net.fast) return;
+  if(net.role==='guest') netStat('🟡 en sala '+online.code+' vía relay'+t);
+  else if(net.role==='host') netStat('🟡 P2 por relay'+t);
+}
+function relayConnect(onUp){
+  if(typeof Paho==='undefined'){ onUp(false); return; }
+  if(!online.code){ onUp(false); return; }
+  try{ if(relay.client) relay.client.disconnect(); }catch(e){}
+  relay.client=null; relay.ready=false;
+  const T=relayTopics();
+  let bi=0;
+  function attempt(){
+    if(!net.role){ onUp(false); return; }
+    if(bi>=RELAY_BROKERS.length){ onUp(false); return; }
+    const B=RELAY_BROKERS[bi++];
+    let c=null;
+    try{ c=new Paho.MQTT.Client(B.host,B.port,B.path,'mt'+Math.random().toString(36).slice(2,10)); }
+    catch(e){ attempt(); return; }
+    relay.client=c;
+    const to=setTimeout(()=>{ if(relay.client===c){ try{c.disconnect();}catch(e){} relay.client=null; attempt(); } },9000);
+    c.onConnectionLost=()=>{ relay.ready=false; if(relay.client!==c) return; relay.client=null;
+      if(net.role){ relayNote(' (reconectando…)'); setTimeout(()=>{ if(net.role&&!relay.ready) relayConnect(ok=>{ if(ok) relayNote(' (de vuelta)'); }); },4000); } };
+    c.onMessageArrived=(mm)=>{
+      try{
+        const t=mm.destinationName, p=mm.payloadString;
+        if(net.role==='host'&&t===T.g2h){ const m=JSON.parse(p); if(m.k==='in') hostGotInput(m); else if(m.k==='join'){ relayNote(' ¡P2 anunció llegada!'); netHello(); } }
+        else if(net.role==='guest'&&t===T.h2g){ relayNote(''); netOnMsg(JSON.parse(p)); }
+      }catch(e){}
+    };
+    c.connect({useSSL:true,timeout:7,keepAliveInterval:30,
+      onSuccess:()=>{
+        clearTimeout(to);
+        if(relay.client!==c||!net.role) return;
+        try{ c.subscribe(net.role==='host'?T.g2h:T.h2g); relay.ready=true; onUp(true); }
+        catch(e){ relay.client=null; attempt(); }
+      },
+      onFailure:()=>{ clearTimeout(to); if(relay.client===c){ relay.client=null; attempt(); } }
+    });
+  }
+  attempt();
 }
 function leaveNetSilent(){
   try{ if(net.dc&&net.dc.close) net.dc.close(); }catch(e){}
@@ -589,6 +662,8 @@ function leaveNetSilent(){
   try{ if(net.pc) net.pc.close(); }catch(e){}
   try{ if(online.peer) online.peer.destroy(); }catch(e){}
   net.role=null; net.pc=null; net.dc=null; online.conn=null; online.peer=null; online.code=null;
+  try{ if(relay.client) relay.client.disconnect(); }catch(e){}
+  relay.client=null; relay.ready=false; net.fast=false;
   player2=null; remoteInput=null;
 }
 function leaveNet(){
@@ -608,16 +683,20 @@ function serMap(){
   return o;
 }
 function netHello(){
-  if(!net.dc||net.dc.readyState!=='open'||!dungeon) return;
-  try{ net.dc.send(JSON.stringify({k:'hello',fl:floorN,map:serMap(),curKey:cur.x+','+cur.y,stm:startTime,kc:killCount,st:state,p1:player,p2:player2})); }catch(e){}
+  if(!dungeon) return;
+  const o={k:'hello',hid:++net.hid,fl:floorN,map:serMap(),curKey:cur.x+','+cur.y,stm:startTime,kc:killCount,st:state,p1:player,p2:player2};
+  try{ if(net.dc&&net.dc.readyState==='open') net.dc.send(JSON.stringify(o)); }catch(e){}
+  if(net.role==='host') relaySend(relayTopics().h2g,o);
 }
 function netSend(){
   try{
-    net.dc.send(JSON.stringify({k:'snap',st:state,kc:killCount,sh:Math.round(shake),stm:startTime,
+    const o={k:'snap',sq:++net.seq,st:state,kc:killCount,sh:Math.round(shake),stm:startTime,
       p1:player,p2:player2,ck:cur.x+','+cur.y,cl:cur.cleared,it:cur.item,
       en:cur.enemies.map(e=>({t:e.type,x:Math.round(e.x*10)/10,y:Math.round(e.y*10)/10,hp:Math.round(e.hp*100)/100,mhp:e.maxhp,r:e.r,fl:e.flash,bu:e.burnT||0,wk:Math.round((e.walk||0)*100)/100,at:e.atk||0,cd:e.cd||0,cd2:e.cd2||0,dt:e.dashT||0,sd:e.seed||1,sp:e.speed})),
       te:tears.map(t=>({x:Math.round(t.x*10)/10,y:Math.round(t.y*10)/10,vx:Math.round(t.vx*100)/100,vy:Math.round(t.vy*100)/100,life:t.life,dmg:t.dmg,r:t.r,burn:!!t.burn,bubble:!!t.bubble,color:t.color})),
-      eb:ebullets, pk:(cur.pickups||[]), bb:placed.map(b=>({x:Math.round(b.x),y:Math.round(b.y),t:b.t})), dark:Math.round(darkV*100)/100, fl:floorN, ev:evQueue.splice(0,evQueue.length), msg:pickupMsg}));
+      eb:ebullets, pk:(cur.pickups||[]), bb:placed.map(b=>({x:Math.round(b.x),y:Math.round(b.y),t:b.t})), dark:Math.round(darkV*100)/100, fl:floorN, ev:evQueue.splice(0,evQueue.length), msg:pickupMsg};
+    try{ if(net.dc&&net.dc.readyState==='open') net.dc.send(JSON.stringify(o)); }catch(e){}
+    if(net.role==='host') relaySend(relayTopics().h2g,o);
   }catch(e){}
 }
 function guestAmbient(){
@@ -626,12 +705,10 @@ function guestAmbient(){
 }
 function netOnMsg(m){
   if(!m||!m.k) return;
-  if(m.k==='in'&&net.role==='host'){
-    remoteInput={mx:+m.mx||0,my:+m.my||0,sx:+m.sx||0,sy:+m.sy||0,b:+m.b||0};
-    return;
-  }
+  if(m.k==='in'&&net.role==='host'){ hostGotInput(m); return; }
   if(net.role!=='guest') return;
   if(m.k==='hello'){
+    if(m.hid!=null){ if(lastHid!=null&&m.hid<=lastHid) return; lastHid=m.hid; }
     dungeon={map:{},key:(x,y)=>x+','+y};
     for(const k in m.map){ const r=m.map[k]; dungeon.map[k]={x:r.x,y:r.y,type:r.type,cleared:r.cleared,locked:!!r.locked,item:r.item,seed:r.seed,enemies:[],rocks:r.rocks||[],pits:r.pits||[],pickups:[],wares:r.wares||[],trap:r.trap||null}; }
     cur=dungeon.map[m.curKey];
@@ -644,6 +721,7 @@ function netOnMsg(m){
   }
   if(m.k==='snap'){
     if(!dungeon) return;
+    if(m.sq!=null){ if(lastSnap!=null&&m.sq<=lastSnap) return; lastSnap=m.sq; }
     state=m.st; killCount=m.kc; shake=Math.max(shake,m.sh||0); startTime=m.stm; pickupMsg=m.msg;
     player=Object.assign(player||makePlayer(),m.p1);
     player2=m.p2?Object.assign(player2||makePlayer(),m.p2):null;
@@ -658,10 +736,13 @@ function netOnMsg(m){
   }
 }
 function guestTick(){
-  if(!net.dc||net.dc.readyState!=='open') return;
-  if(frame%2===0){
-    try{ net.dc.send(JSON.stringify({k:'in',mx:keys['a']?-1:keys['d']?1:0,my:keys['w']?-1:keys['s']?1:0,sx:keys['arrowleft']?-1:keys['arrowright']?1:0,sy:keys['arrowup']?-1:keys['arrowdown']?1:0,b:keys[' ']?1:0})); }catch(e){}
-  }
+  if(frame%2!==0) return;
+  const upP2P=net.dc&&net.dc.readyState==='open';
+  if(!upP2P&&!relay.ready) return;
+  const o={k:'in',iq:++net.iseq,mx:keys['a']?-1:keys['d']?1:0,my:keys['w']?-1:keys['s']?1:0,sx:keys['arrowleft']?-1:keys['arrowright']?1:0,sy:keys['arrowup']?-1:keys['arrowdown']?1:0,b:keys[' ']?1:0};
+  if(upP2P){ try{ net.dc.send(JSON.stringify(o)); }catch(e){} }
+  if(net.role==='guest'&&online.code) relaySend(relayTopics().g2h,o);
+  if(net.role==='guest'&&relay.ready&&lastHid==null&&frame%120===0) relaySend(relayTopics().g2h,{k:'join'});
 }
 // cablear botones (si existen en el DOM)
 (function(){

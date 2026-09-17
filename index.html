@@ -460,7 +460,7 @@ function setupDC(){
 async function hostGame(){
   try{
     net.role='host';
-    net.pc=new RTCPeerConnection();
+    net.pc=new RTCPeerConnection({iceServers:ICE_SERVERS});
     net.dc=net.pc.createDataChannel('game'); setupDC();
     const offer=await net.pc.createOffer(); await net.pc.setLocalDescription(offer);
     await waitGather(net.pc);
@@ -473,7 +473,7 @@ async function joinGame(){
   try{
     const code=readCode(); if(!code){ netStat('⚠️ pega primero el CÓDIGO 1 del host'); return; }
     net.role='guest';
-    net.pc=new RTCPeerConnection();
+    net.pc=new RTCPeerConnection({iceServers:ICE_SERVERS});
     net.pc.ondatachannel=(ev)=>{ net.dc=ev.channel; setupDC(); };
     await net.pc.setRemoteDescription(JSON.parse(atob(code)));
     const ans=await net.pc.createAnswer(); await net.pc.setLocalDescription(ans);
@@ -491,6 +491,17 @@ async function acceptAnswer(){
 }
 // --- ONLINE: salas con código vía PeerJS (nube gratis, partida P2P directa) ---
 const online={peer:null,conn:null,code:null};
+// NAT traversal gratis: STUN de Google (descubre tu IP pública) + TURN de
+// OpenRelay (retransmite si ambos NAT son estrictos o el firewall bloquea UDP).
+// Sin esto solo conecta en la misma máquina/red. Todo sigue siendo estático.
+const ICE_SERVERS=[
+  {urls:'stun:stun.l.google.com:19302'},
+  {urls:'stun:stun1.l.google.com:19302'},
+  {urls:'turn:openrelay.metered.ca:80',username:'openrelay',credential:'openrelaypassword'},
+  {urls:'turn:openrelay.metered.ca:443',username:'openrelay',credential:'openrelaypassword'},
+  {urls:'turns:openrelay.metered.ca:443',username:'openrelay',credential:'openrelaypassword'},
+  {urls:'turn:0.peerjs.com:3478',username:'peerjs',credential:'peerjsp'}
+];
 function roomCode(){ const A='ABCDEFGHJKMNPQRSTUVWXYZ23456789'; let s=''; for(let i=0;i<5;i++) s+=A[Math.floor(Math.random()*A.length)]; return s; }
 function roomLink(code){ try{ return location.href.split('?')[0]+'?room='+code; }catch(e){ return '?room='+code; } }
 function copyRoomLink(){
@@ -515,11 +526,26 @@ function copyRoomLink(){
 function onlineSetup(conn){
   net.dc={ readyState:'connecting', send(s){ try{ conn.send(s); }catch(e){} } };
   conn.on('open',()=>{
+    try{ if(conn._to) clearTimeout(conn._to); }catch(e){}
     net.dc.readyState='open';
     const bl=el('btnLeave'); if(bl) bl.disabled=false;
     if(net.role==='host'){ netStat('🟢 sala '+online.code+': P2 conectado'); if(!player2){ player2=makePlayer(); player2.x=440; player2.y=380; } netHello(); hidePanel(); }
     else netStat('🟢 en sala '+online.code+' como P2');
   });
+  conn.on('iceStateChanged',(st)=>{
+    if(net.dc&&net.dc.readyState!=='open'&&st) netStat('⏳ red: '+st+'… (cruzando NAT, espera)');
+  });
+  if(net.role==='guest'){
+    try{ if(conn._to) clearTimeout(conn._to); }catch(e){}
+    conn._to=setTimeout(()=>{
+      try{
+        if(net.dc&&net.dc.readyState!=='open'){
+          netStat('❌ sin conexión tras 20s: NAT/firewall estricto. Reintenta, o jueguen en la misma red (modo LAN).');
+          try{ conn.close(); }catch(e){}
+        }
+      }catch(e){}
+    },20000);
+  }
   conn.on('data',(d)=>{ try{ netOnMsg(typeof d==='string'?JSON.parse(d):d); }catch(e){} });
   conn.on('close',()=>{
     netStat('🔴 sala cerrada');
@@ -534,7 +560,7 @@ function onlineHost(){
   leaveNetSilent();
   net.role='host';
   online.code=roomCode();
-  try{ online.peer=new Peer('martirio-azul-'+online.code); }
+  try{ online.peer=new Peer('martirio-azul-'+online.code,{config:{iceServers:ICE_SERVERS}}); }
   catch(e){ netStat('❌ no se pudo crear la sala'); net.role=null; return; }
   online.peer.on('open',()=>{ const link=roomLink(online.code); netStat('⏳ sala '+online.code+': comparte el código o el link…'); showCode('SALA: '+online.code+'\nLINK: '+link+'\n(el guest abre el link o escribe el código arriba y pulsa Unirse)'); });
   online.peer.on('connection',(c)=>{ online.conn=c; onlineSetup(c); });
@@ -548,7 +574,7 @@ function onlineJoin(){
   leaveNetSilent();
   net.role='guest';
   online.code=code;
-  try{ online.peer=new Peer(); }
+  try{ online.peer=new Peer({config:{iceServers:ICE_SERVERS}}); }
   catch(e){ netStat('❌ no se pudo conectar'); net.role=null; return; }
   online.peer.on('open',()=>{
     netStat('⏳ conectando a sala '+code+'…');

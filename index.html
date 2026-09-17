@@ -37,7 +37,8 @@
 <div id="netpanel" style="display:none;margin-top:8px;max-width:800px;text-align:center;">
   <div style="font-size:12px;opacity:.8;margin-bottom:4px;">CÓDIGO (cópialo y pásalo por chat/USB al otro PC):</div>
   <textarea id="netcode" rows="4" cols="70" style="width:100%;max-width:640px;font-size:11px;background:#14141d;color:#d8d0c0;border:1px solid #6b5d3f;"></textarea>
-  <div><button id="btnAccept" style="font-family:inherit;padding:4px 12px;cursor:pointer;margin-top:4px;">✅ Aceptar código pegado (solo HOST)</button></div>
+  <div><button id="btnAccept" style="font-family:inherit;padding:4px 12px;cursor:pointer;margin-top:4px;">✅ Aceptar código pegado (solo HOST)</button>
+  <button id="btnCopyLink" style="font-family:inherit;padding:4px 12px;cursor:pointer;margin-top:4px;">🔗 Copiar link de sala</button></div>
 </div>
 <script>
 const cv = document.getElementById('game');
@@ -378,6 +379,25 @@ function nextFloor(){
 }
 function hasNeighbor(r,dx,dy){ return !!dungeon.map[dungeon.key(r.x+dx,r.y+dy)]; }
 
+// ============================================================================
+// NETCODE — co-op 2 jugadores, 100% estático (GitHub Pages OK), costo cero.
+// Arquitectura: HOST AUTORITATIVO.
+//  - El host (P1) simula TODO (mazmorra, enemigos, lágrimas, daño, tienda).
+//  - El guest (P2) solo envía inputs {mx,my,sx,sy,b} (~30/s) y dibuja snapshots.
+//  - Snapshots del host ~20/s: jugadores, enemigos, lágrimas, balas, sala,
+//    pickups, bombas, oscuridad, piso + eventos visuales (bursts, mensajes).
+// Transporte, dos modos sin servidor dedicado:
+//  A) ONLINE (PeerJS/WebRTC): la nube gratuita de PeerJS solo hace la
+//     "presentación" (señalización); luego el juego viaja P2P directo.
+//     Sala = código de 5 letras o link ?room=CODIGO.
+//  B) LAN manual (offline): intercambio de ofertas/respuestas copiando códigos.
+// Separación de responsabilidades:
+//  - Entrada:  keys → in1 (host/P1) / guestTick() → {k:'in'} (guest/P2).
+//  - Simulación: stepPlayer(), update() + cerebros (SOLO host).
+//  - Render: draw() dibuja el estado actual, venga de sim local o snapshot.
+// Bordes cubiertos: sala inexistente, caída de un peer (el otro sigue jugando),
+// R solo en host (reinicia a ambos vía netHello), revive co-op por sala limpia.
+// ============================================================================
 // ---------- CO-OP LAN (WebRTC manual, sin servidor) ----------
 const net={role:null,pc:null,dc:null,waitAnswer:false};
 function el(id){ try{ return document.getElementById(id); }catch(e){ return null; } }
@@ -472,6 +492,26 @@ async function acceptAnswer(){
 // --- ONLINE: salas con código vía PeerJS (nube gratis, partida P2P directa) ---
 const online={peer:null,conn:null,code:null};
 function roomCode(){ const A='ABCDEFGHJKMNPQRSTUVWXYZ23456789'; let s=''; for(let i=0;i<5;i++) s+=A[Math.floor(Math.random()*A.length)]; return s; }
+function roomLink(code){ try{ return location.href.split('?')[0]+'?room='+code; }catch(e){ return '?room='+code; } }
+function copyRoomLink(){
+  const link=online.code?roomLink(online.code):roomLink('');
+  const done=()=>netStat('🔗 link copiado, pásalo a tu compa');
+  try{
+    if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(link).then(done,()=>{ showCode(link); });
+    else showCode(link);
+  }catch(e){ showCode(link); }
+}
+// Auto-unión: si la URL trae ?room=CODIGO, pre-rellena y entra solo.
+(function(){
+  let code=null;
+  try{ code=new URLSearchParams(location.search).get('room'); }catch(e){}
+  if(code){
+    code=code.trim().toUpperCase();
+    const inp=el('roomcode'); if(inp) inp.value=code;
+    netStat('⏳ link de sala detectado ('+code+'), entrando…');
+    setTimeout(()=>{ if(net.role) return; onlineJoin(); },900);
+  }
+})();
 function onlineSetup(conn){
   net.dc={ readyState:'connecting', send(s){ try{ conn.send(s); }catch(e){} } };
   conn.on('open',()=>{
@@ -496,7 +536,7 @@ function onlineHost(){
   online.code=roomCode();
   try{ online.peer=new Peer('martirio-azul-'+online.code); }
   catch(e){ netStat('❌ no se pudo crear la sala'); net.role=null; return; }
-  online.peer.on('open',()=>{ netStat('⏳ sala '+online.code+': comparte el código con tu compa…'); showCode('SALA: '+online.code+'  (el guest la escribe arriba y pulsa Unirse)'); });
+  online.peer.on('open',()=>{ const link=roomLink(online.code); netStat('⏳ sala '+online.code+': comparte el código o el link…'); showCode('SALA: '+online.code+'\nLINK: '+link+'\n(el guest abre el link o escribe el código arriba y pulsa Unirse)'); });
   online.peer.on('connection',(c)=>{ online.conn=c; onlineSetup(c); });
   online.peer.on('error',(e)=>{ if(e&&e.type==='unavailable-id') netStat('⚠️ código en uso, pulsa Crear sala otra vez'); });
   const bl=el('btnLeave'); if(bl) bl.disabled=false;
@@ -607,6 +647,8 @@ function guestTick(){
   const bO=el('btnOnline'), bR=el('btnRoomJoin');
   if(bO) bO.onclick=onlineHost;
   if(bR) bR.onclick=onlineJoin;
+  const bC=el('btnCopyLink');
+  if(bC) bC.onclick=copyRoomLink;
 })();
 
 function initGame(){
